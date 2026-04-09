@@ -10,15 +10,22 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.provider.CalendarContract
 import android.text.InputType
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.RelativeSizeSpan
+import android.text.style.StyleSpan
+import android.text.style.TypefaceSpan
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.widget.ArrayAdapter
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.Spinner
 import android.widget.TextView
@@ -36,7 +43,6 @@ import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
-import kotlin.math.abs
 
 // -----------------------
 // Room: Entities / DAO / DB
@@ -136,6 +142,17 @@ interface ProjectDao {
     @Query("SELECT * FROM projects WHERE isArchived = 0 ORDER BY createdAt ASC")
     fun getActiveProjects(): List<ProjectEntity>
 
+    @Query("""
+        SELECT DISTINCT p.*
+        FROM projects p
+        INNER JOIN tasks t ON t.projectId = p.id
+        WHERE p.isArchived = 1
+          AND t.doneAt IS NULL
+          AND t.listType = 'PROJECT'
+        ORDER BY p.createdAt ASC
+    """)
+    fun getArchivedProjectsWithActiveTasks(): List<ProjectEntity>
+
     @Query("SELECT * FROM projects WHERE id = :id LIMIT 1")
     fun getById(id: Long): ProjectEntity?
 
@@ -144,6 +161,12 @@ interface ProjectDao {
 
     @Insert
     fun insert(p: ProjectEntity): Long
+
+    @Update
+    fun update(p: ProjectEntity)
+
+    @Query("UPDATE projects SET isArchived = 0 WHERE id = :id")
+    fun unarchiveById(id: Long)
 
     @Query("UPDATE projects SET isArchived = 1 WHERE id = :id")
     fun archiveById(id: Long)
@@ -272,11 +295,17 @@ class MainActivity : AppCompatActivity() {
         const val EXTRA_OPEN_CAPTURE = "com.gustav.minigtd.extra.OPEN_CAPTURE"
         private const val CALENDAR_PERMISSION_REQUEST = 2001
         private const val PREF_WRITE_CALENDAR_ID = "write_calendar_id"
+        private const val PREF_DUE_REMINDER_MINUTES = "due_reminder_minutes"
     }
 
     // --- UI ---
     private lateinit var header: TextView
     private lateinit var body: TextView
+    private lateinit var helpOverlay: FrameLayout
+    private lateinit var helpPanel: LinearLayout
+    private lateinit var helpTitle: TextView
+    private lateinit var helpBody: TextView
+    private lateinit var helpHint: TextView
 
     // --- DB ---
     private lateinit var db: MiniGtdDatabase
@@ -313,8 +342,30 @@ class MainActivity : AppCompatActivity() {
         val startTimeHHMM: String,
         val endTimeHHMM: String,
         val location: String,
+        val description: String,
+        val reminderLabel: String
+    )
+
+    private data class CalendarInsertResult(
+        val eventSaved: Boolean,
+        val reminderSaved: Boolean
+    )
+
+    private data class HelpRow(
+        val shortcut: String,
         val description: String
     )
+
+    private data class HelpSection(
+        val title: String,
+        val rows: List<HelpRow>
+    )
+
+    private enum class ProjectLookupResult {
+        CREATED,
+        OPENED,
+        RESTORED
+    }
 
     private var screen: Screen = Screen.INBOX
     private var lastKey: String = "—"
@@ -332,6 +383,7 @@ class MainActivity : AppCompatActivity() {
     private var dialog: AlertDialog? = null
     private var dialogEdit: EditText? = null
     private var pendingDueEditorTaskId: Long? = null
+    private var isHelpVisible = false
 
     // Process (selected item)
     private var processFrom: ListId? = null
@@ -372,8 +424,15 @@ class MainActivity : AppCompatActivity() {
 
         header = findViewById(R.id.header)
         body = findViewById(R.id.body)
+        helpOverlay = findViewById(R.id.help_overlay)
+        helpPanel = findViewById(R.id.help_panel)
+        helpTitle = findViewById(R.id.help_title)
+        helpBody = findViewById(R.id.help_body)
+        helpHint = findViewById(R.id.help_hint)
         body.isFocusableInTouchMode = true
         body.requestFocus()
+        helpOverlay.setOnClickListener { toggleHelpOverlay(false) }
+        helpPanel.setOnClickListener { }
 
         db = MiniGtdDatabase.get(this)
         taskDao = db.taskDao()
@@ -381,6 +440,8 @@ class MainActivity : AppCompatActivity() {
         doneDao = db.doneDao()
         settingsDao = db.settingsDao()
         reviewItemDao = db.reviewItemDao()
+
+        repairArchivedProjectsWithActiveTasks()
 
         loadSettingsApplyTheme()
 
@@ -495,6 +556,34 @@ class MainActivity : AppCompatActivity() {
         prefs.edit().putLong(PREF_WRITE_CALENDAR_ID, calendarId).apply()
     }
 
+    private fun dueReminderOptions(): List<Pair<String, Int?>> = listOf(
+        "None" to null,
+        "At time of event" to 0,
+        "5 min before" to 5,
+        "10 min before" to 10,
+        "15 min before" to 15,
+        "30 min before" to 30,
+        "1 hour before" to 60,
+        "1 day before" to 1440
+    )
+
+    private fun dueReminderMinutesToLabel(minutes: Int?): String {
+        return dueReminderOptions().firstOrNull { it.second == minutes }?.first ?: "None"
+    }
+
+    private fun dueReminderLabelToMinutes(label: String): Int? {
+        return dueReminderOptions().firstOrNull { it.first == label.trim() }?.second
+    }
+
+    private fun loadDefaultDueReminderMinutes(): Int? {
+        val saved = prefs.getInt(PREF_DUE_REMINDER_MINUTES, 10)
+        return if (saved == -1) null else dueReminderOptions().firstOrNull { it.second == saved }?.second ?: 10
+    }
+
+    private fun saveDefaultDueReminderMinutes(minutes: Int?) {
+        prefs.edit().putInt(PREF_DUE_REMINDER_MINUTES, minutes ?: -1).apply()
+    }
+
     @Suppress("DEPRECATION")
     private fun appRevisionLabel(): String {
         return try {
@@ -558,7 +647,8 @@ class MainActivity : AppCompatActivity() {
             startTimeHHMM = formatHHMM(start.timeInMillis),
             endTimeHHMM = formatHHMM(end.timeInMillis),
             location = "",
-            description = ""
+            description = "",
+            reminderLabel = dueReminderMinutesToLabel(loadDefaultDueReminderMinutes())
         )
     }
 
@@ -626,7 +716,11 @@ class MainActivity : AppCompatActivity() {
         ).show()
     }
 
-    private fun showDatePickerForField(field: EditText, fallbackMillis: Long? = null) {
+    private fun showDatePickerForField(
+        field: EditText,
+        fallbackMillis: Long? = null,
+        onPicked: (() -> Unit)? = null
+    ) {
         val parsed = parseYYMMDD(field.text?.toString().orEmpty())
             ?: Calendar.getInstance().apply {
                 if (fallbackMillis != null) timeInMillis = fallbackMillis
@@ -636,6 +730,7 @@ class MainActivity : AppCompatActivity() {
             this,
             { _, pickedYear, pickedMonth, pickedDay ->
                 field.setText(String.format(Locale.US, "%02d%02d%02d", pickedYear % 100, pickedMonth + 1, pickedDay))
+                onPicked?.invoke()
             },
             parsed.get(Calendar.YEAR),
             parsed.get(Calendar.MONTH),
@@ -671,9 +766,10 @@ class MainActivity : AppCompatActivity() {
         startMillis: Long,
         endMillis: Long,
         location: String,
-        description: String
-    ): Boolean {
-        if (!hasCalendarPermissions()) return false
+        description: String,
+        reminderMinutes: Int?
+    ): CalendarInsertResult {
+        if (!hasCalendarPermissions()) return CalendarInsertResult(eventSaved = false, reminderSaved = reminderMinutes == null)
 
         val values = ContentValues().apply {
             put(CalendarContract.Events.CALENDAR_ID, calendarId)
@@ -683,10 +779,35 @@ class MainActivity : AppCompatActivity() {
             put(CalendarContract.Events.EVENT_LOCATION, location)
             put(CalendarContract.Events.DESCRIPTION, description)
             put(CalendarContract.Events.EVENT_TIMEZONE, TimeZone.getDefault().id)
+            put(CalendarContract.Events.HAS_ALARM, if (reminderMinutes != null) 1 else 0)
         }
 
         return try {
-            contentResolver.insert(CalendarContract.Events.CONTENT_URI, values) != null
+            val eventUri = contentResolver.insert(CalendarContract.Events.CONTENT_URI, values)
+            val eventId = eventUri?.lastPathSegment?.toLongOrNull()
+            val reminderSaved = when {
+                reminderMinutes == null -> true
+                eventId == null -> false
+                else -> insertCalendarReminder(eventId, reminderMinutes)
+            }
+            CalendarInsertResult(
+                eventSaved = eventUri != null,
+                reminderSaved = reminderSaved
+            )
+        } catch (_: Exception) {
+            CalendarInsertResult(eventSaved = false, reminderSaved = reminderMinutes == null)
+        }
+    }
+
+    private fun insertCalendarReminder(eventId: Long, minutes: Int): Boolean {
+        val values = ContentValues().apply {
+            put(CalendarContract.Reminders.EVENT_ID, eventId)
+            put(CalendarContract.Reminders.MINUTES, minutes)
+            put(CalendarContract.Reminders.METHOD, CalendarContract.Reminders.METHOD_ALERT)
+        }
+
+        return try {
+            contentResolver.insert(CalendarContract.Reminders.CONTENT_URI, values) != null
         } catch (_: Exception) {
             false
         }
@@ -762,7 +883,7 @@ class MainActivity : AppCompatActivity() {
         pageSize = s.pageSize.coerceIn(5, 99)
         pageSizeLog = s.pageSizeLog.coerceIn(3, 99)
         backgroundMode = if (s.backgroundMode == "BLACK") "BLACK" else "WHITE"
-        textColor = s.textColor
+        textColor = if (backgroundMode == "BLACK") Color.WHITE else Color.BLACK
 
         // Apply colors
         applyThemeColors()
@@ -770,6 +891,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyThemeColors() {
         val bg = if (backgroundMode == "BLACK") Color.BLACK else Color.WHITE
+        val fg = if (backgroundMode == "BLACK") Color.WHITE else Color.BLACK
+        textColor = fg
+        val panelBg = if (backgroundMode == "BLACK") Color.parseColor("#121212") else Color.parseColor("#FAFAFA")
+        val panelBorder = if (backgroundMode == "BLACK") Color.parseColor("#5F5F5F") else Color.parseColor("#D0D0D0")
 
         // Background on activity root
         //val root = findViewById<TextView>(android.R.id.content)
@@ -781,11 +906,21 @@ class MainActivity : AppCompatActivity() {
         // Header/body
         header.setBackgroundColor(bg)
         body.setBackgroundColor(bg)
-        header.setTextColor(textColor)
-        body.setTextColor(textColor)
+        header.setTextColor(fg)
+        body.setTextColor(fg)
+        helpPanel.background = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = 28f
+            setColor(panelBg)
+            setStroke(2, panelBorder)
+        }
+        helpTitle.setTextColor(fg)
+        helpBody.setTextColor(fg)
+        helpHint.setTextColor(if (backgroundMode == "BLACK") Color.parseColor("#BDBDBD") else Color.parseColor("#5C5C5C"))
     }
 
     private fun saveSettings() {
+        textColor = if (backgroundMode == "BLACK") Color.WHITE else Color.BLACK
         settingsDao.upsert(
             SettingsEntity(
                 id = 1,
@@ -802,7 +937,6 @@ class MainActivity : AppCompatActivity() {
         pageSize = 18
         pageSizeLog = 9
         backgroundMode = "WHITE"
-        textColor = Color.BLACK
         saveSettings()
         lastKey = "settings: defaults restored"
         render()
@@ -810,41 +944,25 @@ class MainActivity : AppCompatActivity() {
 
     // Very simple contrast guard: block “almost same” luminance.
     // (Not perfect, but prevents black-on-black / dark-on-black etc.)
-    private fun isAcceptableTextColor(bg: Int, fg: Int): Boolean {
-        fun luma(c: Int): Int {
-            val r = Color.red(c)
-            val g = Color.green(c)
-            val b = Color.blue(c)
-            // integer-ish luma
-            return (r * 299 + g * 587 + b * 114) / 1000
-        }
-        val diff = abs(luma(bg) - luma(fg))
-        return diff >= 80
+    private fun repairArchivedProjectsWithActiveTasks() {
+        val archivedWithActiveTasks = projectDao.getArchivedProjectsWithActiveTasks()
+        if (archivedWithActiveTasks.isEmpty()) return
+
+        archivedWithActiveTasks.forEach { projectDao.unarchiveById(it.id) }
     }
 
-    private fun parseColorInput(raw: String): Int? {
-        val s = raw.trim()
-        if (s.isEmpty()) return null
-
-        // #RRGGBB or #AARRGGBB
-        if (s.startsWith("#")) {
-            return try { Color.parseColor(s) } catch (_: Exception) { null }
+    private fun getOrCreateProjectByName(name: String): Pair<Long, ProjectLookupResult> {
+        val existing = projectDao.getByNameCaseInsensitive(name)
+        if (existing == null) {
+            return projectDao.insert(ProjectEntity(name = name)) to ProjectLookupResult.CREATED
         }
 
-        // "r,g,b"
-        val parts = s.split(",").map { it.trim() }
-        if (parts.size == 3) {
-            val r = parts[0].toIntOrNull()
-            val g = parts[1].toIntOrNull()
-            val b = parts[2].toIntOrNull()
-            if (r != null && g != null && b != null &&
-                r in 0..255 && g in 0..255 && b in 0..255
-            ) {
-                return Color.rgb(r, g, b)
-            }
+        return if (existing.isArchived) {
+            projectDao.unarchiveById(existing.id)
+            existing.id to ProjectLookupResult.RESTORED
+        } else {
+            existing.id to ProjectLookupResult.OPENED
         }
-
-        return null
     }
 
     // -----------------------
@@ -854,6 +972,13 @@ class MainActivity : AppCompatActivity() {
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.action != KeyEvent.ACTION_DOWN) return super.dispatchKeyEvent(event)
         if (isTextInputActive) return super.dispatchKeyEvent(event)
+        if (isHelpVisible) {
+            val ch = event.unicodeChar.takeIf { it != 0 }?.toChar()?.lowercaseChar()
+            if (ch == 'h' || event.keyCode == KeyEvent.KEYCODE_BACK || event.keyCode == KeyEvent.KEYCODE_ESCAPE) {
+                toggleHelpOverlay(false)
+            }
+            return true
+        }
 
         if (event.keyCode == KeyEvent.KEYCODE_ENTER) {
             // If there's a number buffer, confirm the selection first
@@ -905,35 +1030,9 @@ class MainActivity : AppCompatActivity() {
             when (c) {
                 'w' -> {
                     backgroundMode = if (backgroundMode == "BLACK") "WHITE" else "BLACK"
-                    // Ensure current textColor still OK, else force safe default
-                    val bg = if (backgroundMode == "BLACK") Color.BLACK else Color.WHITE
-                    if (!isAcceptableTextColor(bg, textColor)) {
-                        textColor = if (backgroundMode == "BLACK") Color.WHITE else Color.BLACK
-                        lastKey = "settings: bg toggled, text auto-fixed"
-                    } else {
-                        lastKey = "settings: bg toggled"
-                    }
+                    lastKey = "settings: theme toggled"
                     saveSettings()
                     render()
-                    return true
-                }
-                't' -> {
-                    openTextDialog("Text color", "RGB (r,g,b) or #RRGGBB") { raw ->
-                        val col = parseColorInput(raw)
-                        if (col == null) {
-                            lastKey = "settings: bad color"
-                        } else {
-                            val bg = if (backgroundMode == "BLACK") Color.BLACK else Color.WHITE
-                            if (!isAcceptableTextColor(bg, col)) {
-                                lastKey = "settings: color rejected (too low contrast)"
-                            } else {
-                                textColor = col
-                                saveSettings()
-                                lastKey = "settings: text color set"
-                            }
-                        }
-                        render()
-                    }
                     return true
                 }
                 'p' -> {
@@ -995,7 +1094,8 @@ class MainActivity : AppCompatActivity() {
                 't' -> { trashProcessedItem(); return true }
                 'p' -> { openProjectPickerForProcessedItem(); return true }
                 'g' -> { convertProcessedItemToProject(); return true }
-                'e' -> { editDueForProcessedItem(); return true }
+                'e' -> { editProcessedItemTitle(); return true }
+                'u' -> { editDueForProcessedItem(); return true }
                 'b' -> { backFromProcess(); return true }
             }
         }
@@ -1005,7 +1105,8 @@ class MainActivity : AppCompatActivity() {
             when (c) {
                 'c' -> { openTextDialog("Add action", "next action") { addActionToOpenProject(it) }; return true }
                 't' -> { deleteSelectedActionFromOpenProject(); return true }
-                'e' -> { editDueForSelectedProjectAction(); return true }
+                'e' -> { editProjectDetailSelection(); return true }
+                'u' -> { editDueForSelectedProjectAction(); return true }
                 'b' -> { goTo(Screen.PROJECTS, "b (back→projects)"); return true }
                 'z' -> { page -= 1; lastKey = "z (prev page)"; render(); return true }
                 'x' -> { page += 1; lastKey = "x (next page)"; render(); return true }
@@ -1016,6 +1117,7 @@ class MainActivity : AppCompatActivity() {
         if (screen == Screen.PROJECTS) {
             when (c) {
                 'c' -> { openTextDialog("New project", "project name") { addProject(it) }; return true }
+                'e' -> { editSelectedProjectName(); return true }
                 't' -> { archiveSelectedProject(); return true }
                 'b' -> { goTo(Screen.INBOX, "b (back→inbox)"); return true }
                 'z' -> { page -= 1; lastKey = "z (prev page)"; render(); return true }
@@ -1081,7 +1183,8 @@ class MainActivity : AppCompatActivity() {
         // List screens: direct move if item selected, else fall through to global nav
         if (screen == Screen.INBOX || screen == Screen.SOMEDAY || screen == Screen.NEXT || screen == Screen.WAITING) {
             when (c) {
-                'e' -> { editDueForSelectedListItem(); return true }
+                'e' -> { editSelectedListItemTitle(); return true }
+                'u' -> { editDueForSelectedListItem(); return true }
                 'd', 'f', 's', 'a' -> {
                     if (selectedSlot != null) {
                         val dest = when (c) {
@@ -1100,6 +1203,7 @@ class MainActivity : AppCompatActivity() {
 
         // Global keys (views + capture + paging + back)
         when (c) {
+            'h' -> { toggleHelpOverlay(); return true }
             'a' -> { goTo(Screen.INBOX, "a (inbox)"); return true }
             'd' -> { goTo(Screen.NEXT, "d (next)"); return true }
             'f' -> { goTo(Screen.WAITING, "f (waiting)"); return true }
@@ -1256,13 +1360,20 @@ class MainActivity : AppCompatActivity() {
 
     // --- Dialog (text input) ---
 
-    private fun openTextDialog(title: String, hint: String, onOk: (String) -> Unit) {
+    private fun openTextDialog(
+        title: String,
+        hint: String,
+        initialValue: String = "",
+        onOk: (String) -> Unit
+    ) {
         isTextInputActive = true
         val input = EditText(this).apply {
             this.hint = hint
             isSingleLine = true
             imeOptions = EditorInfo.IME_ACTION_DONE
             typeface = workSansRegular
+            setText(initialValue)
+            setSelection(text.length)
             requestFocus()
             setOnEditorActionListener { _, actionId, _ ->
                 if (actionId == EditorInfo.IME_ACTION_DONE) {
@@ -1477,9 +1588,9 @@ class MainActivity : AppCompatActivity() {
             }
         } else {
             val note = if (permissionMissing) {
-                "Calendar permission missing. Save will open your calendar app."
+                "Calendar permission missing. Save will open your calendar app. Reminder may need to be set there."
             } else {
-                "No writable calendars found. Save will open your calendar app."
+                "No writable calendars found. Save will open your calendar app. Reminder may need to be set there."
             }
             form.addView(
                 noteView(note),
@@ -1501,11 +1612,25 @@ class MainActivity : AppCompatActivity() {
             rightHint = "YYMMDD"
         )
 
+        var endDateAutoFromStart = true
         listOf(startDateField, endDateField).forEach { field ->
             makePickerField(field)
         }
-        startDateField.setOnClickListener { showDatePickerForField(startDateField, task.dueMillis) }
-        endDateField.setOnClickListener { showDatePickerForField(endDateField, task.dueMillis) }
+        startDateField.setOnClickListener {
+            showDatePickerForField(startDateField, task.dueMillis) {
+                val startText = startDateField.text?.toString().orEmpty()
+                val startDate = parseYYMMDD(startText)
+                val endDate = parseYYMMDD(endDateField.text?.toString().orEmpty())
+                if (endDateAutoFromStart || (startDate != null && endDate != null && endDate.timeInMillis < startDate.timeInMillis)) {
+                    endDateField.setText(startText)
+                }
+            }
+        }
+        endDateField.setOnClickListener {
+            showDatePickerForField(endDateField, task.dueMillis) {
+                endDateAutoFromStart = false
+            }
+        }
 
         val (startTimeField, endTimeField) = addTwoColumnFields(
             leftLabel = "Start time",
@@ -1595,6 +1720,32 @@ class MainActivity : AppCompatActivity() {
             ).apply { bottomMargin = dpInt(6f) }
         )
 
+        form.addView(labelView("Reminder"))
+        val reminderChoices = dueReminderOptions().map { it.first }
+        val reminderSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_item, reminderChoices).also {
+                it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            }
+            val reminderIndex = reminderChoices.indexOf(prefill.reminderLabel).let { if (it >= 0) it else 0 }
+            setSelection(reminderIndex)
+        }
+        form.addView(
+            reminderSpinner,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dpInt(4f) }
+        )
+        if (!canWriteDirectly) {
+            form.addView(
+                noteView("Reminder choice is only applied automatically when miniGTD can save directly to a writable calendar."),
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dpInt(6f) }
+            )
+        }
+
         val locationField = addField("Location", prefill.location, "optional")
         val descriptionField = addField("Description", prefill.description, "optional", multiLine = true, lines = 3)
 
@@ -1648,6 +1799,8 @@ class MainActivity : AppCompatActivity() {
             val endMillis = endFull.timeInMillis
             val location = locationField.text?.toString()?.trim().orEmpty()
             val description = descriptionField.text?.toString()?.trim().orEmpty()
+            val reminderMinutes = dueReminderLabelToMinutes(reminderSpinner.selectedItem?.toString().orEmpty())
+            saveDefaultDueReminderMinutes(reminderMinutes)
 
             taskDao.setDue(task.id, startMillis)
             if (processTaskId == task.id) {
@@ -1658,18 +1811,23 @@ class MainActivity : AppCompatActivity() {
                 ?.let { calendars.getOrNull(it.selectedItemPosition) }
                 ?.also { saveDefaultCalendarId(it.id) }
 
-            val directSaved = if (selectedCalendar != null) {
+            val insertResult = if (selectedCalendar != null) {
                 insertTimedCalendarEvent(
                     calendarId = selectedCalendar.id,
                     title = title,
                     startMillis = startMillis,
                     endMillis = endMillis,
                     location = location,
-                    description = description
+                    description = description,
+                    reminderMinutes = reminderMinutes
                 )
             } else {
-                false
+                CalendarInsertResult(
+                    eventSaved = false,
+                    reminderSaved = reminderMinutes == null
+                )
             }
+            val directSaved = insertResult.eventSaved
 
             val fallbackOpened = if (!directSaved) {
                 openCalendarInsert(
@@ -1684,7 +1842,10 @@ class MainActivity : AppCompatActivity() {
             }
 
             lastKey = when {
+                directSaved && reminderMinutes != null && insertResult.reminderSaved -> "due set + calendar + reminder saved"
+                directSaved && reminderMinutes != null -> "due set + calendar saved (check reminder)"
                 directSaved -> "due set + calendar saved"
+                fallbackOpened && reminderMinutes != null -> "due set + calendar opened (set reminder there)"
                 fallbackOpened -> "due set + calendar opened"
                 permissionMissing -> "due set (calendar permission missing)"
                 !canWriteDirectly -> "due set (no writable calendar)"
@@ -1858,14 +2019,17 @@ class MainActivity : AppCompatActivity() {
 
         taskDao.deleteById(id)
 
-        val existing = projectDao.getByNameCaseInsensitive(name)
-        val projectId = if (existing != null) existing.id else projectDao.insert(ProjectEntity(name = name))
+        val (projectId, lookupResult) = getOrCreateProjectByName(name)
 
         openProjectId = projectId
         screen = Screen.PROJECT_DETAIL
         page = 0
         selectedSlot = null
-        lastKey = "project open"
+        lastKey = when (lookupResult) {
+            ProjectLookupResult.CREATED -> "project created"
+            ProjectLookupResult.OPENED -> "project open"
+            ProjectLookupResult.RESTORED -> "project restored"
+        }
 
         processFrom = null
         processTaskId = null
@@ -1879,9 +2043,87 @@ class MainActivity : AppCompatActivity() {
         openDueEditorForTask(id)
     }
 
+    private fun renameTaskById(
+        taskId: Long,
+        dialogTitle: String = "Edit task",
+        hint: String = "task name",
+        successNote: String = "task renamed",
+        onRenamed: ((String) -> Unit)? = null
+    ) {
+        val task = taskDao.getById(taskId) ?: run {
+            lastKey = "e (missing task)"
+            render()
+            return
+        }
+
+        openTextDialog(dialogTitle, hint, initialValue = task.title) { raw ->
+            val trimmed = raw.trim()
+            if (trimmed.isEmpty()) {
+                lastKey = "edit (empty ignored)"
+                render()
+                return@openTextDialog
+            }
+            if (trimmed == task.title) {
+                lastKey = "edit unchanged"
+                render()
+                return@openTextDialog
+            }
+
+            taskDao.update(task.copy(title = trimmed))
+            onRenamed?.invoke(trimmed)
+            lastKey = successNote
+            render()
+        }
+    }
+
+    private fun renameProjectById(
+        projectId: Long,
+        dialogTitle: String = "Edit project",
+        hint: String = "project name",
+        successNote: String = "project renamed",
+        onRenamed: ((String) -> Unit)? = null
+    ) {
+        val project = projectDao.getById(projectId) ?: run {
+            lastKey = "e (missing project)"
+            render()
+            return
+        }
+
+        openTextDialog(dialogTitle, hint, initialValue = project.name) { raw ->
+            val trimmed = raw.trim()
+            if (trimmed.isEmpty()) {
+                lastKey = "edit (empty ignored)"
+                render()
+                return@openTextDialog
+            }
+            if (trimmed == project.name) {
+                lastKey = "edit unchanged"
+                render()
+                return@openTextDialog
+            }
+
+            val existing = projectDao.getByNameCaseInsensitive(trimmed)
+            if (existing != null && existing.id != project.id) {
+                lastKey = "project exists"
+                render()
+                return@openTextDialog
+            }
+
+            projectDao.update(project.copy(name = trimmed))
+            onRenamed?.invoke(trimmed)
+            lastKey = successNote
+            render()
+        }
+    }
+
+    private fun editProcessedItemTitle() {
+        val id = processTaskId ?: return
+        renameTaskById(id, onRenamed = { processText = it })
+    }
+
     // --- Due from list screens (direct) ---
 
-    private fun editDueForSelectedListItem() {
+    private fun editSelectedListItemTitle() {
         val listId = screenToListId(screen) ?: return
         val slot = selectedSlot ?: run {
             lastKey = "e (no selection)"
@@ -1893,6 +2135,26 @@ class MainActivity : AppCompatActivity() {
         val index = page * pageSize + slot
         if (index !in tasks.indices) {
             lastKey = "e (out of range)"
+            render()
+            return
+        }
+
+        val t = tasks[index]
+        renameTaskById(t.id)
+    }
+
+    private fun editDueForSelectedListItem() {
+        val listId = screenToListId(screen) ?: return
+        val slot = selectedSlot ?: run {
+            lastKey = "u (no selection)"
+            render()
+            return
+        }
+
+        val tasks = taskDao.getActiveForList(listIdToDbListType(listId))
+        val index = page * pageSize + slot
+        if (index !in tasks.indices) {
+            lastKey = "u (out of range)"
             render()
             return
         }
@@ -2003,8 +2265,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val existing = projectDao.getByNameCaseInsensitive(text)
-        val projectId = if (existing != null) existing.id else projectDao.insert(ProjectEntity(name = text))
+        val (projectId, lookupResult) = getOrCreateProjectByName(text)
 
         taskDao.moveToProject(taskId, projectId)
 
@@ -2020,7 +2281,11 @@ class MainActivity : AppCompatActivity() {
         cleanupPending()
 
         val p = projectDao.getById(projectId)
-        lastKey = "created project: ${p?.name ?: text}"
+        lastKey = when (lookupResult) {
+            ProjectLookupResult.CREATED -> "created project: ${p?.name ?: text}"
+            ProjectLookupResult.OPENED -> "project open"
+            ProjectLookupResult.RESTORED -> "project restored: ${p?.name ?: text}"
+        }
         render()
     }
 
@@ -2036,12 +2301,15 @@ class MainActivity : AppCompatActivity() {
         val trimmed = name.trim()
         if (trimmed.isEmpty()) return
 
-        val existing = projectDao.getByNameCaseInsensitive(trimmed)
-        val id = if (existing != null) existing.id else projectDao.insert(ProjectEntity(name = trimmed))
+        val (id, lookupResult) = getOrCreateProjectByName(trimmed)
 
         openProjectId = id
         screen = Screen.PROJECT_DETAIL
-        lastKey = if (existing != null) "project open" else "project created"
+        lastKey = when (lookupResult) {
+            ProjectLookupResult.CREATED -> "project created"
+            ProjectLookupResult.OPENED -> "project open"
+            ProjectLookupResult.RESTORED -> "project restored"
+        }
         page = 0
         selectedSlot = null
         render()
@@ -2070,6 +2338,24 @@ class MainActivity : AppCompatActivity() {
         render()
     }
 
+    private fun editSelectedProjectName() {
+        val slot = selectedSlot ?: run {
+            lastKey = "e (no selection)"
+            render()
+            return
+        }
+
+        val projects = projectDao.getActiveProjects()
+        val index = page * pageSize + slot
+        if (index !in projects.indices) {
+            lastKey = "e (out of range)"
+            render()
+            return
+        }
+
+        renameProjectById(projects[index].id)
+    }
+
     private fun archiveSelectedProject() {
         val slot = selectedSlot ?: run {
             lastKey = "t (no selection)"
@@ -2086,6 +2372,13 @@ class MainActivity : AppCompatActivity() {
         }
 
         val p = projects[index]
+        val activeActionCount = taskDao.getActiveForProject(p.id).size
+        if (activeActionCount > 0) {
+            lastKey = "project has $activeActionCount open action${if (activeActionCount == 1) "" else "s"}"
+            render()
+            return
+        }
+
         projectDao.archiveById(p.id)
 
         logDone(p.name, origin = "project", project = p.name)
@@ -2143,23 +2436,52 @@ class MainActivity : AppCompatActivity() {
         render()
     }
 
-    private fun editDueForSelectedProjectAction() {
+    private fun editProjectDetailSelection() {
         val pid = openProjectId ?: run {
             lastKey = "e (no project)"
             render()
             return
         }
 
+        val slot = selectedSlot
+        if (slot == null) {
+            renameProjectById(pid)
+            return
+        }
+
+        val actions = taskDao.getActiveForProject(pid)
+        val index = page * pageSize + slot
+        if (index !in actions.indices) {
+            lastKey = "e (out of range)"
+            render()
+            return
+        }
+
+        renameTaskById(
+            taskId = actions[index].id,
+            dialogTitle = "Edit action",
+            hint = "action name",
+            successNote = "action renamed"
+        )
+    }
+
+    private fun editDueForSelectedProjectAction() {
+        val pid = openProjectId ?: run {
+            lastKey = "u (no project)"
+            render()
+            return
+        }
+
         val actions = taskDao.getActiveForProject(pid)
         val slot = selectedSlot ?: run {
-            lastKey = "e (no selection)"
+            lastKey = "u (no selection)"
             render()
             return
         }
 
         val index = page * pageSize + slot
         if (index !in actions.indices) {
-            lastKey = "e (out of range)"
+            lastKey = "u (out of range)"
             render()
             return
         }
@@ -2200,6 +2522,131 @@ class MainActivity : AppCompatActivity() {
         return "${t.title}$due"
     }
 
+    private fun helpSection(title: String, vararg rows: Pair<String, String>): HelpSection {
+        return HelpSection(
+            title = title,
+            rows = rows.map { HelpRow(shortcut = it.first, description = it.second) }
+        )
+    }
+
+    private fun appendHelpSections(out: SpannableStringBuilder, vararg sections: HelpSection) {
+        if (sections.isEmpty()) return
+
+        val maxShortcutWidth = sections
+            .flatMap { it.rows }
+            .maxOfOrNull { it.shortcut.length }
+            ?: 0
+
+        sections.forEachIndexed { index, section ->
+            val titleStart = out.length
+            out.append(section.title.uppercase(Locale.getDefault()))
+            out.append('\n')
+            out.setSpan(StyleSpan(Typeface.BOLD), titleStart, out.length - 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            out.setSpan(TypefaceSpan("monospace"), titleStart, out.length - 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            out.setSpan(RelativeSizeSpan(0.9f), titleStart, out.length - 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+
+            section.rows.forEach { row ->
+                val rowStart = out.length
+                out.append(row.shortcut.padEnd(maxShortcutWidth))
+                out.append("  ")
+                out.append(row.description)
+                out.append('\n')
+                out.setSpan(TypefaceSpan("monospace"), rowStart, out.length - 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                out.setSpan(RelativeSizeSpan(0.84f), rowStart, out.length - 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
+
+            if (index < sections.lastIndex) {
+                out.append('\n')
+            }
+        }
+    }
+
+    private fun helpTitleForCurrentScreen(): String = when (screen) {
+        Screen.INBOX -> "Help - Inbox"
+        Screen.NEXT -> "Help - Next"
+        Screen.WAITING -> "Help - Waiting"
+        Screen.SOMEDAY -> "Help - Someday"
+        Screen.PROJECTS -> "Help - Projects"
+        Screen.PROJECT_DETAIL -> "Help - Project"
+        Screen.PROJECT_PICKER -> "Help - Pick Project"
+        Screen.PROCESS -> "Help - Process"
+        Screen.LOG -> "Help - Log"
+        Screen.REVIEW -> "Help - Review"
+        Screen.SETTINGS -> "Help - Settings"
+    }
+
+    private fun helpSectionsForCurrentScreen(): List<HelpSection> {
+        return when (screen) {
+            Screen.SETTINGS -> listOf(
+                helpSection("Theme", "w" to "toggle light / dark"),
+                helpSection("Layout", "p" to "set page size", "o" to "set log page size"),
+                helpSection("Navigation", "r" to "restore defaults", "b" to "back")
+            )
+
+            Screen.PROCESS -> listOf(
+                helpSection("Move", "d" to "next", "f" to "waiting", "s" to "someday"),
+                helpSection("Project", "p" to "pick project", "g" to "new project"),
+                helpSection("Task", "e" to "edit title", "u" to "set due + calendar/reminder", "t" to "done", "b" to "back")
+            )
+
+            Screen.PROJECT_PICKER -> listOf(
+                helpSection("Selection", "1..${currentPageItemCount()}" to "select project", "enter" to "move item"),
+                helpSection("Actions", "c" to "create project from item"),
+                helpSection("Navigation", "b" to "back", "z/x" to "page")
+            )
+
+            Screen.PROJECTS -> listOf(
+                helpSection("Selection", "1..${currentPageItemCount()}" to "select project", "enter" to "open"),
+                helpSection("Actions", "c" to "new project", "e" to "rename selected", "t" to "mark done (empty project)"),
+                helpSection("Navigation", "b" to "back", "z/x" to "page")
+            )
+
+            Screen.LOG -> listOf(
+                helpSection("Navigation", "z/x" to "page", "b" to "back")
+            )
+
+            Screen.PROJECT_DETAIL -> listOf(
+                helpSection("Selection", "1..${currentPageItemCount()}" to "select action"),
+                helpSection("Actions", "c" to "add action", "e" to "rename action / project", "u" to "set due + reminder", "t" to "mark done"),
+                helpSection("Move Selected", "a" to "inbox", "d" to "next", "f" to "waiting", "s" to "someday"),
+                helpSection("Navigation", "b" to "back", "z/x" to "page")
+            )
+
+            Screen.INBOX, Screen.SOMEDAY, Screen.NEXT, Screen.WAITING -> listOf(
+                helpSection("Selection", "1..${currentPageItemCount()}" to "select item", "enter" to "open"),
+                helpSection("Move Selected", "a" to "inbox", "d" to "next", "f" to "waiting", "s" to "someday"),
+                helpSection("Actions", "c" to "capture", "e" to "edit selected", "u" to "set due + calendar/reminder"),
+                helpSection("Views", "a" to "inbox", "d" to "next", "f" to "waiting", "s" to "someday", "g" to "projects", "r" to "review", "l" to "log", "q" to "settings"),
+                helpSection("Navigation", "z/x" to "page")
+            )
+
+            Screen.REVIEW -> listOf(
+                helpSection("Actions", "i" to "add trigger", "t" to "remove selected", "c" to "capture to inbox"),
+                helpSection("Selection", "1..${currentPageItemCount()}" to "select trigger"),
+                helpSection("Views", "a" to "inbox", "d" to "next", "f" to "waiting", "s" to "someday", "g" to "projects", "l" to "log", "q" to "settings"),
+                helpSection("Navigation", "z/x" to "page")
+            )
+        }
+    }
+
+    private fun renderHelpOverlay() {
+        val helpText = SpannableStringBuilder().apply {
+            append("Shortcuts for the current screen")
+            append('\n')
+            append('\n')
+            appendHelpSections(this, *helpSectionsForCurrentScreen().toTypedArray())
+        }
+
+        helpTitle.text = helpTitleForCurrentScreen()
+        helpBody.text = helpText
+        helpOverlay.visibility = if (isHelpVisible) View.VISIBLE else View.GONE
+    }
+
+    private fun toggleHelpOverlay(forceVisible: Boolean? = null) {
+        isHelpVisible = forceVisible ?: !isHelpVisible
+        renderHelpOverlay()
+    }
+
     // --- Render ---
 
     private fun render() {
@@ -2213,28 +2660,31 @@ class MainActivity : AppCompatActivity() {
             else -> "miniGTD — ${screen.name.lowercase()}"
         }
 
-        body.text = buildString {
-            appendLine("last key: $lastKey")
-            appendLine()
+        val out = SpannableStringBuilder()
+        fun appendLine(text: String = "") {
+            out.append(text)
+            out.append('\n')
+        }
 
-            when (screen) {
+        appendLine("last key: $lastKey")
+        appendLine()
+
+        when (screen) {
 
                 Screen.SETTINGS -> {
-                    val bg = if (backgroundMode == "BLACK") "BLACK" else "WHITE"
+                    val isDark = backgroundMode == "BLACK"
                     appendLine("settings")
                     appendLine()
                     appendLine("revision: ${appRevisionLabel()}")
-                    appendLine("pageSize: $pageSize")
-                    appendLine("pageSizeLog: $pageSizeLog")
-                    appendLine("background: $bg")
-                    appendLine("textColor: ${String.format("#%08X", textColor)}")
                     appendLine()
-                    appendLine("w = toggle bg (white/black)")
-                    appendLine("t = set text color (RGB or hex)")
-                    appendLine("p = set pageSize")
-                    appendLine("o = set pageSizeLog")
-                    appendLine("r = restore defaults")
-                    appendLine("b = back")
+                    appendLine("appearance")
+                    appendLine("  ${if (!isDark) "[x]" else "[ ]"} Light mode")
+                    appendLine("  ${if (isDark) "[x]" else "[ ]"} Dark mode")
+                    appendLine()
+                    appendLine("layout")
+                    appendLine("  Page size: $pageSize")
+                    appendLine("  Log page size: $pageSizeLog")
+                    appendLine()
                 }
 
                 Screen.PROCESS -> {
@@ -2243,15 +2693,6 @@ class MainActivity : AppCompatActivity() {
                     appendLine(processText)
                     appendLine(dueLine)
                     appendLine()
-                    appendLine("process:")
-                    appendLine("  d next")
-                    appendLine("  f waiting")
-                    appendLine("  s someday")
-                    appendLine("  p pick project")
-                    appendLine("  g new project")
-                    appendLine("  e set due + calendar")
-                    appendLine("  t done")
-                    appendLine("  b back")
                 }
 
                 Screen.PROJECT_PICKER -> {
@@ -2284,10 +2725,9 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
 
+                    val n = minOf(pageSize, active.size - page * pageSize).coerceAtLeast(0)
                     appendLine()
-                    appendLine("select: 1..9   move: enter")
-                    appendLine("c = create project from item")
-                    appendLine("back: b   paging: z/x")
+                    appendLine("selectable: 1..$n")
                 }
 
                 Screen.PROJECTS -> {
@@ -2313,10 +2753,9 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
 
+                    val n = minOf(pageSize, projects.size - page * pageSize).coerceAtLeast(0)
                     appendLine()
-                    appendLine("select: 1..9   open: enter")
-                    appendLine("new project: c   mark done: t   back: b")
-                    appendLine("paging: z/x")
+                    appendLine("selectable: 1..$n")
                 }
 
                 Screen.LOG -> {
@@ -2343,7 +2782,6 @@ class MainActivity : AppCompatActivity() {
                     }
 
                     appendLine()
-                    appendLine("paging: z/x   back: b")
                 }
 
                 Screen.PROJECT_DETAIL -> {
@@ -2352,7 +2790,6 @@ class MainActivity : AppCompatActivity() {
                     if (p == null) {
                         appendLine("no project open")
                         appendLine()
-                        appendLine("back: b")
                     } else {
                         appendLine("project: ${p.name}")
                         appendLine()
@@ -2377,10 +2814,9 @@ class MainActivity : AppCompatActivity() {
                             }
                         }
 
+                        val n = minOf(pageSize, actions.size - page * pageSize).coerceAtLeast(0)
                         appendLine()
-                        appendLine("add action: c   set due: e   mark done: t   back: b")
-                        appendLine("move selected: a inbox, d next, f waiting, s someday")
-                        appendLine("paging: z/x")
+                        appendLine("selectable: 1..$n")
                     }
                 }
 
@@ -2415,10 +2851,7 @@ class MainActivity : AppCompatActivity() {
 
                     val n = minOf(pageSize, tasks.size - page * pageSize).coerceAtLeast(0)
                     appendLine()
-                    appendLine("select: 1..$n   open: enter")
-                    appendLine("move selected: a inbox, d next, f waiting, s someday")
-                    appendLine("capture: c   set due: e   paging: z/x")
-                    appendLine("views: a inbox, d next, f waiting, s someday, g projects, l log, q settings")
+                    appendLine("selectable: 1..$n")
                 }
 
                 Screen.REVIEW -> {
@@ -2446,18 +2879,15 @@ class MainActivity : AppCompatActivity() {
 
                     val n = minOf(pageSize, items.size - page * pageSize).coerceAtLeast(0)
                     appendLine()
-                    appendLine("i = add trigger   t = remove selected")
-                    appendLine("c = capture to inbox (stays here)")
-                    appendLine("select: 1..$n   paging: z/x")
-                    appendLine("views: a inbox, d next, f waiting, s someday, g projects, l log, q settings")
+                    appendLine("selectable: 1..$n")
                 }
 
                 else -> {
-                    appendLine("views: a inbox, d next, f waiting, s someday, g projects, r review, l log, q settings")
-                    appendLine("capture: c")
-                    appendLine("paging: z/x")
                 }
             }
-        }
+        appendLine()
+        appendLine("help: h")
+        body.text = out
+        renderHelpOverlay()
     }
 }
