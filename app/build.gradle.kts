@@ -14,8 +14,8 @@ android {
         applicationId = "com.gustav.minigtd"
         minSdk = 28
         targetSdk = 36
-        versionCode = 112
-        versionName = "1.12"
+        versionCode = 202
+        versionName = "2.02"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -33,6 +33,11 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
+
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+    }
+    sourceSets.getByName("test").resources.srcDir("schemas")
 }
 
 ksp {
@@ -51,6 +56,7 @@ dependencies {
     implementation(libs.androidx.constraintlayout)
 
     testImplementation(libs.junit)
+    testImplementation("org.robolectric:robolectric:4.16")
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
 }

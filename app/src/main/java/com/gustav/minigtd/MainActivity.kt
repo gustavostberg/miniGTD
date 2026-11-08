@@ -13,6 +13,7 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.provider.CalendarContract
+import android.provider.DocumentsContract
 import android.text.InputType
 import android.text.SpannableStringBuilder
 import android.text.Spanned
@@ -30,6 +31,7 @@ import android.widget.LinearLayout
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import android.net.Uri
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
@@ -43,6 +45,8 @@ import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.UUID
+import org.json.JSONObject
 
 // -----------------------
 // Room: Entities / DAO / DB
@@ -107,6 +111,13 @@ data class ReviewItemEntity(
     val createdAt: Long = System.currentTimeMillis()
 )
 
+@Entity(tableName = "imported_inbox_tasks")
+data class ImportedInboxTaskEntity(
+    @PrimaryKey val uuid: String,
+    val importedAt: Long = System.currentTimeMillis(),
+    val taskId: Long? = null
+)
+
 @Dao
 interface ReviewItemDao {
     @Query("SELECT * FROM review_items ORDER BY createdAt ASC")
@@ -117,6 +128,15 @@ interface ReviewItemDao {
 
     @Query("DELETE FROM review_items WHERE id = :id")
     fun deleteById(id: Long)
+}
+
+@Dao
+interface ImportedInboxTaskDao {
+    @Query("SELECT COUNT(*) FROM imported_inbox_tasks WHERE uuid = :uuid")
+    fun countByUuid(uuid: String): Int
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    fun insert(e: ImportedInboxTaskEntity): Long
 }
 
 /**
@@ -237,8 +257,15 @@ interface SettingsDao {
 }
 
 @Database(
-    entities = [ProjectEntity::class, TaskEntity::class, DoneEntity::class, SettingsEntity::class, ReviewItemEntity::class],
-    version = 3
+    entities = [
+        ProjectEntity::class,
+        TaskEntity::class,
+        DoneEntity::class,
+        SettingsEntity::class,
+        ReviewItemEntity::class,
+        ImportedInboxTaskEntity::class
+    ],
+    version = 4
 )
 abstract class MiniGtdDatabase : RoomDatabase() {
     abstract fun projectDao(): ProjectDao
@@ -246,38 +273,67 @@ abstract class MiniGtdDatabase : RoomDatabase() {
     abstract fun doneDao(): DoneDao
     abstract fun settingsDao(): SettingsDao
     abstract fun reviewItemDao(): ReviewItemDao
+    abstract fun importedInboxTaskDao(): ImportedInboxTaskDao
 
     companion object {
         @Volatile private var INSTANCE: MiniGtdDatabase? = null
 
+        val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS settings (
+                        id INTEGER NOT NULL,
+                        pageSize INTEGER NOT NULL,
+                        pageSizeLog INTEGER NOT NULL,
+                        backgroundMode TEXT NOT NULL,
+                        textColor INTEGER NOT NULL,
+                        PRIMARY KEY(id)
+                    )
+                """)
+            }
+        }
+
         val MIGRATION_2_3 = object : Migration(2, 3) {
-            override fun migrate(database: SupportSQLiteDatabase) {
-                database.execSQL("""
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
                     CREATE TABLE IF NOT EXISTS review_items (
                         id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
                         title TEXT NOT NULL,
                         createdAt INTEGER NOT NULL
                     )
                 """)
-                database.execSQL("CREATE INDEX IF NOT EXISTS index_review_items_createdAt ON review_items(createdAt)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_review_items_createdAt ON review_items(createdAt)")
+            }
+        }
+
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS imported_inbox_tasks (
+                        uuid TEXT NOT NULL,
+                        importedAt INTEGER NOT NULL,
+                        taskId INTEGER,
+                        PRIMARY KEY(uuid)
+                    )
+                """)
             }
         }
 
         fun get(context: Context): MiniGtdDatabase {
             return INSTANCE ?: synchronized(this) {
+                INSTANCE?.let { return@synchronized it }
                 val inst = Room.databaseBuilder(
                     context.applicationContext,
                     MiniGtdDatabase::class.java,
                     "minigtd.db"
                 )
                     .allowMainThreadQueries()
-                    .addMigrations(MIGRATION_2_3)
-                    .fallbackToDestructiveMigration()
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                     .build()
 
-                INSTANCE = inst
                 val sdao = inst.settingsDao()
                 if (sdao.get() == null) sdao.upsert(SettingsEntity())
+                INSTANCE = inst
                 inst
             }
         }
@@ -294,8 +350,10 @@ class MainActivity : AppCompatActivity() {
         const val EXTRA_OPEN_INBOX = "com.gustav.minigtd.extra.OPEN_INBOX"
         const val EXTRA_OPEN_CAPTURE = "com.gustav.minigtd.extra.OPEN_CAPTURE"
         private const val CALENDAR_PERMISSION_REQUEST = 2001
+        private const val IMPORT_INBOX_TREE_REQUEST = 2002
         private const val PREF_WRITE_CALENDAR_ID = "write_calendar_id"
         private const val PREF_DUE_REMINDER_MINUTES = "due_reminder_minutes"
+        private const val PREF_IMPORT_INBOX_TREE_URI = "import_inbox_tree_uri"
     }
 
     // --- UI ---
@@ -314,12 +372,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var doneDao: DoneDao
     private lateinit var settingsDao: SettingsDao
     private lateinit var reviewItemDao: ReviewItemDao
+    private lateinit var importedInboxTaskDao: ImportedInboxTaskDao
 
     // --- Screens / state ---
     private enum class Screen {
         INBOX, SOMEDAY, NEXT, WAITING,
         PROJECTS, PROJECT_DETAIL,
         REVIEW,
+        IMPORT_INBOX,
         PROCESS,
         PROJECT_PICKER,
         LOG,
@@ -327,6 +387,30 @@ class MainActivity : AppCompatActivity() {
     }
 
     private enum class ListId { INBOX, SOMEDAY, NEXT, WAITING }
+
+    private data class InboxImportItem(
+        val uuid: String,
+        val title: String,
+        val requestedListType: String,
+        val projectName: String?,
+        val projectId: Long?,
+        val dueMillis: Long?,
+        val documentUri: Uri,
+        val displayName: String,
+        val checked: Boolean = true
+    )
+
+    private data class ImportInboxFolder(
+        val treeUri: Uri,
+        val documentId: String,
+        val label: String
+    )
+
+    private data class ImportChildDocument(
+        val documentId: String,
+        val displayName: String,
+        val mimeType: String
+    )
 
     private data class CalendarTarget(
         val id: Long,
@@ -396,6 +480,13 @@ class MainActivity : AppCompatActivity() {
     private var pendingTaskTitle: String = ""
     private var pendingFrom: ListId? = null
 
+    // JSON inbox import
+    private var importItems: List<InboxImportItem> = emptyList()
+    private var importInvalidCount = 0
+    private var importDuplicateCount = 0
+    private var importLoadError: String? = null
+    private var importFolderLabel: String = ""
+
     // Limits
     private val maxPickerProjects = 30
     private val doneLogMax = 100
@@ -417,6 +508,10 @@ class MainActivity : AppCompatActivity() {
     private val dueFmt = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).apply {
         isLenient = false
     }
+    private val importDueFmt = SimpleDateFormat("d MMM", Locale.getDefault()).apply {
+        isLenient = false
+    }
+    private val importAllowedListTypes = setOf("INBOX", "SOMEDAY", "NEXT", "WAITING", "PROJECT")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -440,6 +535,7 @@ class MainActivity : AppCompatActivity() {
         doneDao = db.doneDao()
         settingsDao = db.settingsDao()
         reviewItemDao = db.reviewItemDao()
+        importedInboxTaskDao = db.importedInboxTaskDao()
 
         repairArchivedProjectsWithActiveTasks()
 
@@ -457,6 +553,33 @@ class MainActivity : AppCompatActivity() {
         if (!consumeLauncherIntent(intent)) {
             render()
         }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != IMPORT_INBOX_TREE_REQUEST) return
+
+        val uri = data?.data
+        if (resultCode != RESULT_OK || uri == null) {
+            lastKey = "import folder cancelled"
+            render()
+            return
+        }
+
+        val flags = if (data.flags and Intent.FLAG_GRANT_WRITE_URI_PERMISSION != 0) {
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        } else {
+            Intent.FLAG_GRANT_READ_URI_PERMISSION
+        }
+        try {
+            contentResolver.takePersistableUriPermission(uri, flags)
+        } catch (_: Exception) {
+            // Some providers grant temporary access only. Reading may still work now.
+        }
+
+        prefs.edit().putString(PREF_IMPORT_INBOX_TREE_URI, uri.toString()).apply()
+        openImportInbox()
     }
 
     override fun onRequestPermissionsResult(
@@ -738,26 +861,18 @@ class MainActivity : AppCompatActivity() {
         ).show()
     }
 
-    private fun setFieldFromFieldPlusMinutes(source: EditText, target: EditText, minutes: Int) {
-        val clean = source.text?.toString().orEmpty().trim()
-        if (!Regex("""^\d{4}$""").matches(clean)) return
-        val sourceHour = clean.substring(0, 2).toIntOrNull() ?: return
-        val sourceMinute = clean.substring(2, 4).toIntOrNull() ?: return
-        val cal = Calendar.getInstance().apply {
-            set(Calendar.HOUR_OF_DAY, sourceHour)
-            set(Calendar.MINUTE, sourceMinute)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
-            add(Calendar.MINUTE, minutes)
-        }
-        target.setText(
-            String.format(
-                Locale.US,
-                "%02d%02d",
-                cal.get(Calendar.HOUR_OF_DAY),
-                cal.get(Calendar.MINUTE)
-            )
-        )
+    private fun setFieldFromFieldPlusMinutes(
+        sourceDate: EditText,
+        sourceTime: EditText,
+        targetDate: EditText?,
+        targetTime: EditText,
+        minutes: Int
+    ) {
+        val date = parseYYMMDD(sourceDate.text.toString()) ?: return
+        val cal = parseHHMM(sourceTime.text.toString(), date) ?: return
+        cal.add(Calendar.MINUTE, minutes)
+        targetDate?.setText(formatYYMMDD(cal.timeInMillis))
+        targetTime.setText(formatHHMM(cal.timeInMillis))
     }
 
     private fun insertTimedCalendarEvent(
@@ -845,7 +960,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         closeDialog()
-        screen = if (openInbox) Screen.INBOX else Screen.NEXT
+        screen = if (openInbox || openCapture) Screen.INBOX else Screen.NEXT
         page = 0
         selectedSlot = null
         numberBuffer = ""
@@ -872,6 +987,388 @@ class MainActivity : AppCompatActivity() {
         launcherIntent.removeExtra(EXTRA_OPEN_INBOX)
         launcherIntent.removeExtra(EXTRA_OPEN_CAPTURE)
         return true
+    }
+
+    // -----------------------
+    // JSON inbox import
+    // -----------------------
+
+    @Suppress("DEPRECATION")
+    private fun pickImportInboxFolder() {
+        closeDialog()
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                        Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                        Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                        Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
+            )
+        }
+
+        try {
+            startActivityForResult(intent, IMPORT_INBOX_TREE_REQUEST)
+        } catch (_: ActivityNotFoundException) {
+            lastKey = "import folder picker failed"
+            render()
+        }
+    }
+
+    private fun getImportInboxTreeUri(): Uri? {
+        return prefs.getString(PREF_IMPORT_INBOX_TREE_URI, null)?.let { Uri.parse(it) }
+    }
+
+    private fun openImportInbox() {
+        val treeUri = getImportInboxTreeUri()
+        if (treeUri == null) {
+            pickImportInboxFolder()
+            return
+        }
+
+        importItems = emptyList()
+        importInvalidCount = 0
+        importDuplicateCount = 0
+        importLoadError = null
+        importFolderLabel = ""
+        try {
+            val folder = resolveImportInboxFolder(treeUri)
+            if (folder == null) {
+                importLoadError = "no _minigtd/inbox"
+            } else {
+                loadImportInbox(folder)
+            }
+        } catch (_: SecurityException) {
+            importLoadError = "folder permission lost"
+        } catch (_: Exception) {
+            importLoadError = "folder read failed"
+        }
+        screen = Screen.IMPORT_INBOX
+        page = 0
+        selectedSlot = if (importItems.isNotEmpty()) 0 else null
+        numberBuffer = ""
+        lastKey = when {
+            importLoadError != null -> "import read failed"
+            importItems.isEmpty() -> "import: no new tasks"
+            else -> "import: ${importItems.size} new"
+        }
+        render()
+    }
+
+    private fun resolveImportInboxFolder(treeUri: Uri): ImportInboxFolder? {
+        val treeDocumentId = try {
+            DocumentsContract.getTreeDocumentId(treeUri)
+        } catch (_: Exception) {
+            importLoadError = "bad folder"
+            return null
+        }
+
+        val selectedName = documentDisplayName(treeUri, treeDocumentId)
+            ?: documentNameFromId(treeDocumentId)
+
+        if (selectedName.equals("inbox", ignoreCase = true)) {
+            return ImportInboxFolder(treeUri, treeDocumentId, "selected inbox")
+        }
+
+        val containerNames = listOf("_minigtd", ".minigtd", "miniGTD")
+        containerNames.forEach { containerName ->
+            val container = findChildDirectory(treeUri, treeDocumentId, containerName)
+            if (container != null) {
+                val inbox = findChildDirectory(treeUri, container.documentId, "inbox")
+                if (inbox != null) {
+                    return ImportInboxFolder(treeUri, inbox.documentId, "${container.displayName}/inbox")
+                }
+            }
+        }
+
+        if (
+            selectedName.equals(".minigtd", ignoreCase = true) ||
+            selectedName.equals("_minigtd", ignoreCase = true) ||
+            selectedName.equals("miniGTD", ignoreCase = true)
+        ) {
+            val inbox = findChildDirectory(treeUri, treeDocumentId, "inbox")
+            if (inbox != null) {
+                return ImportInboxFolder(treeUri, inbox.documentId, "$selectedName/inbox")
+            }
+        }
+
+        return null
+    }
+
+    private fun documentDisplayName(treeUri: Uri, documentId: String): String? {
+        val documentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId)
+        val projection = arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+        return try {
+            contentResolver.query(documentUri, projection, null, null, null)?.use { cursor ->
+                val nameCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                if (nameCol >= 0 && cursor.moveToFirst()) cursor.getString(nameCol) else null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun documentNameFromId(documentId: String): String {
+        return documentId
+            .substringAfterLast(':')
+            .substringAfterLast('/')
+            .ifBlank { documentId }
+    }
+
+    private fun findChildDirectory(treeUri: Uri, parentDocumentId: String, name: String): ImportChildDocument? {
+        return listChildDocuments(treeUri, parentDocumentId).firstOrNull { child ->
+            child.mimeType == DocumentsContract.Document.MIME_TYPE_DIR &&
+                    child.displayName.equals(name, ignoreCase = true)
+        }
+    }
+
+    private fun listChildDocuments(treeUri: Uri, parentDocumentId: String): List<ImportChildDocument> {
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocumentId)
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE
+        )
+
+        return contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+            val idCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val nameCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val mimeCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            check(idCol >= 0 && nameCol >= 0 && mimeCol >= 0) { "Missing document columns" }
+
+            buildList {
+                while (cursor.moveToNext()) {
+                    add(
+                        ImportChildDocument(
+                            documentId = cursor.getString(idCol) ?: continue,
+                            displayName = cursor.getString(nameCol).orEmpty(),
+                            mimeType = cursor.getString(mimeCol).orEmpty()
+                        )
+                    )
+                }
+            }
+        } ?: error("Folder query failed")
+    }
+
+    private fun loadImportInbox(folder: ImportInboxFolder) {
+        importItems = emptyList()
+        importInvalidCount = 0
+        importDuplicateCount = 0
+        importLoadError = null
+        importFolderLabel = folder.label
+
+        val loaded = mutableListOf<InboxImportItem>()
+        val seenUuids = mutableSetOf<String>()
+        try {
+            listChildDocuments(folder.treeUri, folder.documentId).forEach { child ->
+                if (child.mimeType == DocumentsContract.Document.MIME_TYPE_DIR) return@forEach
+                if (!child.displayName.endsWith(".json", ignoreCase = true)) return@forEach
+
+                val documentUri = DocumentsContract.buildDocumentUriUsingTree(folder.treeUri, child.documentId)
+                val item = parseImportInboxFile(documentUri, child.displayName)
+                when {
+                    item == null -> importInvalidCount += 1
+                    importedInboxTaskDao.countByUuid(item.uuid) > 0 || !seenUuids.add(item.uuid) -> importDuplicateCount += 1
+                    else -> loaded.add(item)
+                }
+            }
+        } catch (_: SecurityException) {
+            importLoadError = "folder permission lost"
+        } catch (_: Exception) {
+            importLoadError = "folder read failed"
+        }
+
+        importItems = loaded.sortedWith(
+            compareBy<InboxImportItem> { it.displayName.lowercase(Locale.getDefault()) }
+                .thenBy { it.title.lowercase(Locale.getDefault()) }
+        )
+    }
+
+    private fun parseImportInboxFile(documentUri: Uri, displayName: String): InboxImportItem? {
+        val raw = contentResolver.openInputStream(documentUri)?.use { stream ->
+            stream.bufferedReader().use { it.readText() }
+        } ?: error("File read failed")
+
+        val json = try {
+            JSONObject(raw.removePrefix("\uFEFF"))
+        } catch (_: Exception) {
+            return null
+        }
+
+        val uuidText = (json.opt("uuid") as? String)?.trim() ?: return null
+        val uuid = try {
+            UUID.fromString(uuidText).toString().also {
+                if (!it.equals(uuidText, ignoreCase = true)) return null
+            }
+        } catch (_: Exception) {
+            return null
+        }
+
+        val title = (json.opt("title") as? String)?.trim() ?: return null
+        if (title.isEmpty()) return null
+
+        val requestedListType = json
+            .optString("listType", "INBOX")
+            .trim()
+            .uppercase(Locale.US)
+            .let { if (it in importAllowedListTypes) it else "INBOX" }
+
+        val projectName = if (json.has("projectName") && !json.isNull("projectName")) {
+            val value = json.opt("projectName") as? String ?: return null
+            value.trim().ifBlank { null }
+        } else {
+            null
+        }
+        val project = projectName?.let { projectDao.getByNameCaseInsensitive(it) }
+
+        val dueMillis = if (json.has("dueMillis") && !json.isNull("dueMillis")) {
+            when (val value = json.opt("dueMillis")) {
+                is Long -> value
+                is Int -> value.toLong()
+                else -> return null
+            }
+        } else {
+            null
+        }
+
+        return InboxImportItem(
+            uuid = uuid,
+            title = title,
+            requestedListType = requestedListType,
+            projectName = projectName,
+            projectId = project?.id,
+            dueMillis = dueMillis,
+            documentUri = documentUri,
+            displayName = displayName
+        )
+    }
+
+    private fun toggleSelectedImportItem() {
+        val slot = selectedSlot ?: run {
+            lastKey = "x (no selection)"
+            render()
+            return
+        }
+        if (slot !in importItems.indices) {
+            lastKey = "x (out of range)"
+            render()
+            return
+        }
+
+        importItems = importItems.toMutableList().also { items ->
+            val item = items[slot]
+            items[slot] = item.copy(checked = !item.checked)
+            lastKey = if (items[slot].checked) "selected" else "unselected"
+        }
+        render()
+    }
+
+    private fun cancelImportInbox() {
+        importItems = emptyList()
+        importInvalidCount = 0
+        importDuplicateCount = 0
+        importLoadError = null
+        goTo(Screen.INBOX, "import cancelled")
+    }
+
+    private enum class ImportResult { IMPORTED, DUPLICATE, FAILED }
+
+    private fun importCheckedInboxItems() {
+        val selected = importItems.filter { it.checked }
+        if (selected.isEmpty()) {
+            lastKey = "import (none selected)"
+            render()
+            return
+        }
+
+        var imported = 0
+        var duplicates = 0
+        var failed = 0
+        var marked = 0
+
+        selected.forEach { item ->
+            when (importInboxItem(item)) {
+                ImportResult.IMPORTED -> {
+                    imported += 1
+                    if (markImportFileProcessed(item)) marked += 1
+                }
+                ImportResult.DUPLICATE -> {
+                    duplicates += 1
+                    if (markImportFileProcessed(item)) marked += 1
+                }
+                ImportResult.FAILED -> failed += 1
+            }
+        }
+
+        importItems = emptyList()
+        importInvalidCount = 0
+        importDuplicateCount = 0
+        importLoadError = null
+        screen = Screen.INBOX
+        page = 0
+        selectedSlot = null
+        numberBuffer = ""
+        lastKey = buildString {
+            append("imported $imported")
+            if (duplicates > 0) append(", skipped $duplicates")
+            if (failed > 0) append(", failed $failed")
+            if (marked < imported + duplicates) append(", files kept")
+        }
+        render()
+    }
+
+    private fun importInboxItem(item: InboxImportItem): ImportResult {
+        return try {
+            var result = ImportResult.DUPLICATE
+            db.runInTransaction {
+                if (importedInboxTaskDao.countByUuid(item.uuid) > 0) {
+                    result = ImportResult.DUPLICATE
+                    return@runInTransaction
+                }
+
+                val project = item.projectId?.let { projectDao.getById(it) }
+                val targetProjectId = project?.id
+                if (project?.isArchived == true) {
+                    projectDao.unarchiveById(project.id)
+                }
+                val targetListType = if (targetProjectId != null) {
+                    "PROJECT"
+                } else if (item.projectName != null || item.requestedListType == "PROJECT") {
+                    "INBOX"
+                } else {
+                    item.requestedListType
+                }
+
+                val taskId = taskDao.insert(
+                    TaskEntity(
+                        title = item.title,
+                        listType = targetListType,
+                        projectId = targetProjectId,
+                        dueMillis = item.dueMillis
+                    )
+                )
+                importedInboxTaskDao.insert(
+                    ImportedInboxTaskEntity(
+                        uuid = item.uuid,
+                        taskId = taskId
+                    )
+                )
+                result = ImportResult.IMPORTED
+            }
+            result
+        } catch (_: Exception) {
+            ImportResult.FAILED
+        }
+    }
+
+    private fun markImportFileProcessed(item: InboxImportItem): Boolean {
+        return try {
+            DocumentsContract.renameDocument(
+                contentResolver,
+                item.documentUri,
+                "${item.displayName}.imported"
+            ) != null
+        } catch (_: Exception) {
+            false
+        }
     }
 
     // -----------------------
@@ -1001,8 +1498,10 @@ class MainActivity : AppCompatActivity() {
                 Screen.PROJECT_PICKER -> { commitMovePendingItemToSelectedProject(); return true }
                 Screen.PROJECT_DETAIL -> { lastKey = "enter (action noop)"; render(); return true }
                 Screen.PROCESS -> { lastKey = "enter (process)"; render(); return true }
+                Screen.IMPORT_INBOX -> { importCheckedInboxItems(); return true }
+                Screen.REVIEW -> { lastKey = "enter (review noop)"; render(); return true }
+                Screen.LOG -> { lastKey = "enter (log noop)"; render(); return true }
                 Screen.SETTINGS -> { lastKey = "enter (settings noop)"; render(); return true }
-                else -> {}
             }
         }
 
@@ -1063,8 +1562,19 @@ class MainActivity : AppCompatActivity() {
                     }
                     return true
                 }
+                'i' -> { pickImportInboxFolder(); return true }
                 'r' -> { restoreDefaultSettings(); return true }
                 'b' -> { goTo(Screen.INBOX, "b (back→inbox)"); return true }
+            }
+        }
+
+        // IMPORT keys
+        if (screen == Screen.IMPORT_INBOX) {
+            when (c) {
+                'x' -> { toggleSelectedImportItem(); return true }
+                'i' -> { pickImportInboxFolder(); return true }
+                'r' -> { openImportInbox(); return true }
+                'q', 'b' -> { cancelImportInbox(); return true }
             }
         }
 
@@ -1080,8 +1590,8 @@ class MainActivity : AppCompatActivity() {
                     return true
                 }
                 'c' -> { createProjectFromPendingAndMove(); return true }
-                'z' -> { page -= 1; lastKey = "z (prev page)"; render(); return true }
-                'x' -> { page += 1; lastKey = "x (next page)"; render(); return true }
+                'z' -> { changePage(-1); return true }
+                'x' -> { changePage(1); return true }
             }
         }
 
@@ -1108,8 +1618,8 @@ class MainActivity : AppCompatActivity() {
                 'e' -> { editProjectDetailSelection(); return true }
                 'u' -> { editDueForSelectedProjectAction(); return true }
                 'b' -> { goTo(Screen.PROJECTS, "b (back→projects)"); return true }
-                'z' -> { page -= 1; lastKey = "z (prev page)"; render(); return true }
-                'x' -> { page += 1; lastKey = "x (next page)"; render(); return true }
+                'z' -> { changePage(-1); return true }
+                'x' -> { changePage(1); return true }
             }
         }
 
@@ -1120,8 +1630,8 @@ class MainActivity : AppCompatActivity() {
                 'e' -> { editSelectedProjectName(); return true }
                 't' -> { archiveSelectedProject(); return true }
                 'b' -> { goTo(Screen.INBOX, "b (back→inbox)"); return true }
-                'z' -> { page -= 1; lastKey = "z (prev page)"; render(); return true }
-                'x' -> { page += 1; lastKey = "x (next page)"; render(); return true }
+                'z' -> { changePage(-1); return true }
+                'x' -> { changePage(1); return true }
             }
         }
 
@@ -1175,8 +1685,8 @@ class MainActivity : AppCompatActivity() {
                     render()
                     return true
                 }
-                'z' -> { page -= 1; numberBuffer = ""; lastKey = "z (prev page)"; render(); return true }
-                'x' -> { page += 1; numberBuffer = ""; lastKey = "x (next page)"; render(); return true }
+                'z' -> { changePage(-1); return true }
+                'x' -> { changePage(1); return true }
             }
         }
 
@@ -1212,6 +1722,7 @@ class MainActivity : AppCompatActivity() {
             'r' -> { goTo(Screen.REVIEW, "r (review)"); return true }
             'l' -> { goTo(Screen.LOG, "l (log)"); return true }
             'q' -> { goTo(Screen.SETTINGS, "q (settings)"); return true }
+            'i' -> { openImportInbox(); return true }
 
             'c' -> {
                 if (screen != Screen.PROJECT_DETAIL && screen != Screen.PROJECTS && screen != Screen.PROJECT_PICKER && screen != Screen.SETTINGS && screen != Screen.REVIEW) {
@@ -1220,8 +1731,8 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            'z' -> { page -= 1; numberBuffer = ""; lastKey = "z (prev page)"; render(); return true }
-            'x' -> { page += 1; numberBuffer = ""; lastKey = "x (next page)"; render(); return true }
+            'z' -> { changePage(-1); return true }
+            'x' -> { changePage(1); return true }
 
             'b' -> {
                 when (screen) {
@@ -1246,10 +1757,18 @@ class MainActivity : AppCompatActivity() {
 
     // --- Helpers: screen/list types ---
 
+    private fun changePage(delta: Int) {
+        page += delta
+        selectedSlot = null
+        numberBuffer = ""
+        lastKey = if (delta < 0) "z (prev page)" else "x (next page)"
+        render()
+    }
+
     private fun isSelectableListScreen(s: Screen): Boolean {
         return s == Screen.INBOX || s == Screen.SOMEDAY || s == Screen.NEXT || s == Screen.WAITING ||
                 s == Screen.PROJECTS || s == Screen.PROJECT_DETAIL || s == Screen.PROJECT_PICKER ||
-                s == Screen.REVIEW || s == Screen.LOG
+                s == Screen.REVIEW || s == Screen.LOG || s == Screen.IMPORT_INBOX
     }
 
     private fun currentPageItemCount(): Int {
@@ -1280,6 +1799,7 @@ class MainActivity : AppCompatActivity() {
                 val items = reviewItemDao.getAll()
                 minOf(pageSize, items.size - page * pageSize).coerceAtLeast(0)
             }
+            Screen.IMPORT_INBOX -> importItems.size
             else -> 0
         }
     }
@@ -1442,14 +1962,12 @@ class MainActivity : AppCompatActivity() {
         fun labelView(label: String): TextView = TextView(this).apply {
             text = label
             textSize = 11f
-            setTextColor(Color.BLACK)
             typeface = workSansMedium
         }
 
         fun noteView(text: String): TextView = TextView(this).apply {
             this.text = text
             textSize = 11f
-            setTextColor(Color.DKGRAY)
             typeface = workSansRegular
             setPadding(dpInt(8f), dpInt(4f), dpInt(8f), dpInt(8f))
         }
@@ -1616,16 +2134,6 @@ class MainActivity : AppCompatActivity() {
         listOf(startDateField, endDateField).forEach { field ->
             makePickerField(field)
         }
-        startDateField.setOnClickListener {
-            showDatePickerForField(startDateField, task.dueMillis) {
-                val startText = startDateField.text?.toString().orEmpty()
-                val startDate = parseYYMMDD(startText)
-                val endDate = parseYYMMDD(endDateField.text?.toString().orEmpty())
-                if (endDateAutoFromStart || (startDate != null && endDate != null && endDate.timeInMillis < startDate.timeInMillis)) {
-                    endDateField.setText(startText)
-                }
-            }
-        }
         endDateField.setOnClickListener {
             showDatePickerForField(endDateField, task.dueMillis) {
                 endDateAutoFromStart = false
@@ -1641,6 +2149,19 @@ class MainActivity : AppCompatActivity() {
             rightHint = "HHMM"
         )
 
+        startDateField.setOnClickListener {
+            showDatePickerForField(startDateField, task.dueMillis) {
+                val startDate = parseYYMMDD(startDateField.text.toString()) ?: return@showDatePickerForField
+                val oldEndDate = parseYYMMDD(endDateField.text.toString())
+                if (endDateAutoFromStart || (oldEndDate != null && oldEndDate.before(startDate))) {
+                    val start = parseHHMM(startTimeField.text.toString(), startDate)
+                    val end = parseHHMM(endTimeField.text.toString(), startDate) ?: startDate
+                    if (start != null && end.before(start)) end.add(Calendar.DAY_OF_MONTH, 1)
+                    endDateField.setText(formatYYMMDD(end.timeInMillis))
+                }
+            }
+        }
+
         var endTimeAutoFromStart = true
         listOf(startTimeField, endTimeField).forEach { field ->
             makePickerField(field)
@@ -1653,7 +2174,11 @@ class MainActivity : AppCompatActivity() {
                 { _, pickedHour, pickedMinute ->
                     startTimeField.setText(String.format(Locale.US, "%02d%02d", pickedHour, pickedMinute))
                     if (endTimeAutoFromStart) {
-                        setFieldFromFieldPlusMinutes(startTimeField, endTimeField, 60)
+                        setFieldFromFieldPlusMinutes(
+                            startDateField, startTimeField,
+                            if (endDateAutoFromStart) endDateField else null,
+                            endTimeField, 60
+                        )
                     }
                 },
                 hour,
@@ -1691,10 +2216,12 @@ class MainActivity : AppCompatActivity() {
                     setPadding(dpInt(6f), dpInt(6f), dpInt(6f), dpInt(6f))
                     setOnClickListener {
                         if (minutes == null) {
+                            endDateField.setText(startDateField.text)
                             endTimeField.setText(startTimeField.text?.toString().orEmpty())
                         } else {
-                            setFieldFromFieldPlusMinutes(startTimeField, endTimeField, minutes)
+                            setFieldFromFieldPlusMinutes(startDateField, startTimeField, endDateField, endTimeField, minutes)
                         }
+                        endDateAutoFromStart = true
                         endTimeAutoFromStart = false
                     }
                 },
@@ -2522,6 +3049,17 @@ class MainActivity : AppCompatActivity() {
         return "${t.title}$due"
     }
 
+    private fun importMetaLine(item: InboxImportItem): String {
+        val parts = mutableListOf<String>()
+        if (item.projectName != null) {
+            parts.add(if (item.projectId != null) item.projectName else "? ${item.projectName}")
+        } else if (item.requestedListType != "INBOX") {
+            parts.add(item.requestedListType.lowercase(Locale.getDefault()))
+        }
+        item.dueMillis?.let { parts.add(importDueFmt.format(Date(it))) }
+        return parts.joinToString(" · ")
+    }
+
     private fun helpSection(title: String, vararg rows: Pair<String, String>): HelpSection {
         return HelpSection(
             title = title,
@@ -2572,6 +3110,7 @@ class MainActivity : AppCompatActivity() {
         Screen.PROCESS -> "Help - Process"
         Screen.LOG -> "Help - Log"
         Screen.REVIEW -> "Help - Review"
+        Screen.IMPORT_INBOX -> "Help - Import"
         Screen.SETTINGS -> "Help - Settings"
     }
 
@@ -2580,7 +3119,14 @@ class MainActivity : AppCompatActivity() {
             Screen.SETTINGS -> listOf(
                 helpSection("Theme", "w" to "toggle light / dark"),
                 helpSection("Layout", "p" to "set page size", "o" to "set log page size"),
+                helpSection("Import", "i" to "choose inbox folder/root"),
                 helpSection("Navigation", "r" to "restore defaults", "b" to "back")
+            )
+
+            Screen.IMPORT_INBOX -> listOf(
+                helpSection("Import", "enter" to "import checked tasks", "x" to "toggle selected", "r" to "rescan"),
+                helpSection("Folder", "i" to "choose inbox folder/root"),
+                helpSection("Navigation", "q/b" to "cancel")
             )
 
             Screen.PROCESS -> listOf(
@@ -2616,7 +3162,7 @@ class MainActivity : AppCompatActivity() {
                 helpSection("Selection", "1..${currentPageItemCount()}" to "select item", "enter" to "open"),
                 helpSection("Move Selected", "a" to "inbox", "d" to "next", "f" to "waiting", "s" to "someday"),
                 helpSection("Actions", "c" to "capture", "e" to "edit selected", "u" to "set due + calendar/reminder"),
-                helpSection("Views", "a" to "inbox", "d" to "next", "f" to "waiting", "s" to "someday", "g" to "projects", "r" to "review", "l" to "log", "q" to "settings"),
+                helpSection("Views", "a" to "inbox", "d" to "next", "f" to "waiting", "s" to "someday", "g" to "projects", "r" to "review", "l" to "log", "i" to "import", "q" to "settings"),
                 helpSection("Navigation", "z/x" to "page")
             )
 
@@ -2655,6 +3201,7 @@ class MainActivity : AppCompatActivity() {
 
         header.text = when (screen) {
             Screen.PROCESS -> "miniGTD — process"
+            Screen.IMPORT_INBOX -> "miniGTD — import"
             Screen.PROJECT_DETAIL -> "miniGTD — project"
             Screen.PROJECT_PICKER -> "miniGTD — pick project"
             else -> "miniGTD — ${screen.name.lowercase()}"
@@ -2693,6 +3240,45 @@ class MainActivity : AppCompatActivity() {
                     appendLine(processText)
                     appendLine(dueLine)
                     appendLine()
+                }
+
+                Screen.IMPORT_INBOX -> {
+                    appendLine("${importItems.size} NEW TASKS")
+                    if (importFolderLabel.isNotEmpty()) {
+                        appendLine("source: $importFolderLabel")
+                    }
+                    appendLine()
+
+                    importLoadError?.let { error ->
+                        appendLine(error)
+                        appendLine()
+                    }
+
+                    if (importItems.isEmpty()) {
+                        appendLine("(empty)")
+                    } else {
+                        importItems.forEachIndexed { index, item ->
+                            val mark = if (selectedSlot == index) ">" else " "
+                            val check = if (item.checked) "[x]" else "[ ]"
+                            appendLine("$mark$check ${item.title}")
+                            val meta = importMetaLine(item)
+                            if (meta.isNotEmpty()) {
+                                appendLine("    $meta")
+                            }
+                            appendLine()
+                        }
+                    }
+
+                    if (importInvalidCount > 0 || importDuplicateCount > 0) {
+                        appendLine("ignored: $importInvalidCount invalid, $importDuplicateCount already imported")
+                        appendLine()
+                    }
+
+                    appendLine("ENTER Import")
+                    appendLine("X Toggle")
+                    appendLine("Q Cancel")
+                    appendLine("I Folder/Root")
+                    appendLine("R Rescan")
                 }
 
                 Screen.PROJECT_PICKER -> {
@@ -2882,8 +3468,6 @@ class MainActivity : AppCompatActivity() {
                     appendLine("selectable: 1..$n")
                 }
 
-                else -> {
-                }
             }
         appendLine()
         appendLine("help: h")

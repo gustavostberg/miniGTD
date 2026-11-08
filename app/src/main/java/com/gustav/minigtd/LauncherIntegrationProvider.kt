@@ -6,6 +6,7 @@ import android.content.UriMatcher
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.net.Uri
+import androidx.room.InvalidationTracker
 
 class LauncherIntegrationProvider : ContentProvider() {
     companion object {
@@ -22,22 +23,22 @@ class LauncherIntegrationProvider : ContentProvider() {
         val TASKS_URI: Uri = Uri.parse("content://$AUTHORITY/$PATH_TASKS")
     }
 
-    private data class LauncherTask(
-        val id: Long,
-        val title: String,
-        val listType: String,
-        val projectName: String?,
-        val dueMillis: Long?,
-        val createdAt: Long,
-        val priority: Int,
-    )
-
     private val uriMatcher =
         UriMatcher(UriMatcher.NO_MATCH).apply {
             addURI(AUTHORITY, PATH_TASKS, MATCH_TASKS)
         }
 
-    override fun onCreate(): Boolean = true
+    private val taskObserver = object : InvalidationTracker.Observer("tasks") {
+        override fun onInvalidated(tables: Set<String>) {
+            context?.contentResolver?.notifyChange(TASKS_URI, null)
+        }
+    }
+
+    override fun onCreate(): Boolean {
+        val ctx = context ?: return false
+        MiniGtdDatabase.get(ctx).invalidationTracker.addObserver(taskObserver)
+        return true
+    }
 
     override fun query(
         uri: Uri,
@@ -76,23 +77,21 @@ class LauncherIntegrationProvider : ContentProvider() {
         val taskDao = database.taskDao()
         val cursor = emptyCursor()
 
-        val tasks =
-            taskDao.getActiveForLauncherList("NEXT")
-                .map { task -> task.asLauncherTask(priority = 0, projectName = null) }
-                .take(10)
+        val tasks = taskDao.getActiveForLauncherList("NEXT").take(10)
 
-        tasks.forEachIndexed { index, task ->
+        tasks.forEach { task ->
             cursor.addRow(
-                arrayOf(
-                    index.toLong(),
+                arrayOf<Any?>(
+                    task.id,
                     task.title,
                     task.listType,
-                    task.projectName,
+                    null,
                     task.dueMillis,
                 ),
             )
         }
 
+        cursor.setNotificationUri(ctx.contentResolver, TASKS_URI)
         return cursor
     }
 
@@ -108,15 +107,4 @@ class LauncherIntegrationProvider : ContentProvider() {
         )
     }
 
-    private fun TaskEntity.asLauncherTask(priority: Int, projectName: String?): LauncherTask {
-        return LauncherTask(
-            id = id,
-            title = title,
-            listType = listType,
-            projectName = projectName,
-            dueMillis = dueMillis,
-            createdAt = createdAt,
-            priority = priority,
-        )
-    }
 }
